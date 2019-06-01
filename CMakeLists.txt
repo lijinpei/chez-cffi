@@ -1,0 +1,5 @@
+cmake_minimum_required (VERSION 3.13)
+project (chez-cffi)
+add_library (chez_cffi SHARED chez_cffi.cpp ${ChezDev}/kernel.o)
+target_include_directories (chez_cffi PRIVATE ${ChezDev})
+target_link_libraries (chez_cffi PRIVATE clangAST clangFrontend LLVM)
