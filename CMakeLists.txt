@@ -1,5 +1,6 @@
 cmake_minimum_required (VERSION 3.13)
 project (chez-cffi)
+set (CMAKE_CXX_STANDARD 17)
 add_library (chez_cffi SHARED chez_cffi.cpp ${ChezDev}/kernel.o)
 target_include_directories (chez_cffi PRIVATE ${ChezDev})
-target_link_libraries (chez_cffi PRIVATE clangAST clangFrontend LLVM)
+target_link_libraries (chez_cffi PRIVATE clangAST clangFrontend LLVM libstdc++fs.a)

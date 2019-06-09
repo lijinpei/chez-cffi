@@ -14,6 +14,7 @@
 #include "fmt/ostream.h"
 #include "scheme.hpp"
 
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -27,36 +28,6 @@ namespace cs = chezscheme;
 
 namespace {
 
-template <std::size_t N>
-inline bool try_replace_string(const char (&arr)[N], std::string& name) {
-  if (N == 0) {
-    return false;
-  }
-  if (name.size() < N) {
-    return false;
-  }
-  constexpr std::size_t CN = N - 1;
-  for (std::size_t i = 0; i < CN; ++i) {
-    if (name[i] != arr[i]) {
-      return false;
-    }
-  }
-  if (name[CN] == ' ') {
-    name[CN] = '-';
-    return true;
-  }
-  return false;
-}
-
-std::string santize_name(std::string&& name) {
-  constexpr char n1[] = "struct";
-  constexpr char n2[] = "union";
-  constexpr char n3[] = "enum";
-  try_replace_string(n1, name) || try_replace_string(n2, name) ||
-      try_replace_string(n3, name);
-  return name;
-}
-
 cs::ptr cs_array_symbol, cs_struct_symbol, cs_union_symbol, cs_void_symbol,
     cs_bool_symbol, cs_char_symbol, cs_unsigned8_symbol, cs_wchar_symbol,
     cs_unsigned16_symbol, cs_unsigned32_symbol, cs_unsigned_short_symbol,
@@ -64,8 +35,9 @@ cs::ptr cs_array_symbol, cs_struct_symbol, cs_union_symbol, cs_void_symbol,
     cs_unsigned_long_long_symbol, cs_integer8_symbol, cs_short_symbol,
     cs_int_symbol, cs_long_symbol, cs_long_long_symbol, cs_float_symbol,
     cs_double_symbol, cs_function_symbol, cs_pointerstar_symbol,
-    cs_define_constant_symbol;
-cs::ptr cs_display, cs_newline;
+    cs_define_constant_symbol, cs_define_symbol, cs_foreign_procedure_symbol,
+    cs_make_ftype_pointer_symbol, cs_foreign_entry_symbol, cs_begin_symbol;
+cs::ptr cs_write, cs_display, cs_newline, cs_open_output_file;
 bool scheme_initialized = false;
 
 bool Init(std::vector<std::string> boot_files) {
@@ -103,9 +75,16 @@ bool Init(std::vector<std::string> boot_files) {
   cs_function_symbol = cs::Sstring_to_symbol("function");
   cs_pointerstar_symbol = cs::Sstring_to_symbol("*");
   cs_define_constant_symbol = cs::Sstring_to_symbol("define-constant");
+  cs_define_symbol = cs::Sstring_to_symbol("define");
+  cs_foreign_procedure_symbol = cs::Sstring_to_symbol("foreigen-procedure");
+  cs_make_ftype_pointer_symbol = cs::Sstring_to_symbol("make-ftype-pointer");
+  cs_foreign_entry_symbol = cs::Sstring_to_symbol("foreign-entry");
+  cs_begin_symbol = cs::Sstring_to_symbol("begin");
 
+  cs_write = cs::Stop_level_value(cs::Sstring_to_symbol("write"));
   cs_display = cs::Stop_level_value(cs::Sstring_to_symbol("display"));
   cs_newline = cs::Stop_level_value(cs::Sstring_to_symbol("newline"));
+  cs_open_output_file = cs::Stop_level_value(cs::Sstring_to_symbol("open-output-file"));
 
   scheme_initialized = true;
   return true;
@@ -118,6 +97,7 @@ bool Deinit() {
   }
   cs::Sscheme_deinit();
   scheme_initialized = false;
+  return true;
 }
 
 bool TryInit(std::vector<std::string> boot_files) {
@@ -139,26 +119,28 @@ cs::ptr scheme_list(cs::ptr arg0, T... arg) {
   return cs::Scons(arg0, scheme_list(arg...));
 }
 
+cs::ptr scheme_concat(cs::ptr arg) { return arg; }
+cs::ptr scheme_concat(cs::ptr arg1, cs::ptr arg2) {
+  if (cs::snil == arg1) {
+    return arg2;
+  }
+  return cs::Scons(cs::car(arg1), scheme_concat(cs::cdr(arg1), arg2));
+}
+
+template <typename... T>
+cs::ptr scheme_concat(cs::ptr arg0, T... arg) {
+  return scheme_concat(arg0, scheme_concat(arg...));
+}
+
 template <bool name_ok>
 cs::ptr make_ftype(clang::QualType qt);
 
-bool trace_clang = false;
 template <bool name_ok>
 cs::ptr make_ftype(const clang::Type* type) {
   if (auto* et = llvm::dyn_cast<clang::ElaboratedType>(type)) {
-    //return make_ftype<name_ok>(et->getNamedType());
-    if (trace_clang) {
-      llvm::errs() << "ElaboratedType\n";
-    }
     return make_ftype<name_ok>(et->desugar());
-    et->desugar();
-    et->getNamedType();
-    return cs::sfalse;
   }
   if (auto* at = llvm::dyn_cast<clang::ArrayType>(type)) {
-    if (trace_clang) {
-      llvm::errs() << "ArrayType\n";
-    }
     if (auto* ca = llvm::dyn_cast<clang::ConstantArrayType>(at)) {
       cs::ptr et = make_ftype<true>(at->getElementType());
       cs::ptr num = chezscheme::sfixnum(ca->getSize().getLimitedValue());
@@ -170,15 +152,9 @@ cs::ptr make_ftype(const clang::Type* type) {
     }
   }
   if (auto* at = llvm::dyn_cast<clang::AtomicType>(type)) {
-    if (trace_clang) {
-      llvm::errs() << "AtomicType\n";
-    }
     return make_ftype<name_ok>(at->getValueType());
   }
   if (auto* bt = llvm::dyn_cast<clang::BuiltinType>(type)) {
-    if (trace_clang) {
-      llvm::errs() << "BuiltinType\n";
-    }
     if (bt->isSugared()) {
       return make_ftype<name_ok>(bt->desugar());
     }
@@ -233,9 +209,6 @@ cs::ptr make_ftype(const clang::Type* type) {
     return cs::sfalse;
   }
   if (auto* ft = llvm::dyn_cast<clang::FunctionType>(type)) {
-    if (trace_clang) {
-      llvm::errs() << "FunctionType\n";
-    }
     cs::ptr ret = make_ftype<true>(ft->getReturnType());
     cs::ptr par = cs::snil;
     if (llvm::dyn_cast<clang::FunctionNoProtoType>(ft)) {
@@ -254,28 +227,22 @@ cs::ptr make_ftype(const clang::Type* type) {
     return cs::sfalse;
   }
   if (auto* pt = llvm::dyn_cast<clang::ParenType>(type)) {
-    if (trace_clang) {
-      llvm::errs() << "ParenType\n";
-    }
     return make_ftype<name_ok>(pt->desugar());
   }
   if (auto* pt = llvm::dyn_cast<clang::PointerType>(type)) {
-    if (trace_clang) {
-      llvm::errs() << "PointerType\n";
-    }
     return scheme_list(cs_pointerstar_symbol,
                        make_ftype<true>(pt->getPointeeType()));
   }
   if (auto* et = llvm::dyn_cast<clang::EnumType>(type)) {
     llvm::StringRef name = et->getDecl()->getName();
-    std::string nss = "enum-";
-    nss += std::string(name.data(), name.size());
-    return cs::Sstring_to_symbol(nss.data());
+    if (!name.empty()) {
+      std::string nss = "enum-";
+      nss += std::string(name.data(), name.size());
+      return cs::Sstring_to_symbol(nss.data());
+    }
+    return make_ftype<name_ok>(et->getDecl()->getIntegerType().getTypePtr());
   }
   if (auto* tt = llvm::dyn_cast<clang::TagType>(type)) {
-    if (trace_clang) {
-      llvm::errs() << "TagType: " << '\n';
-    }
     if (name_ok) {
       if (const char* name = tt->getTypeClassName()) {
         return cs::Sstring_to_symbol(name);
@@ -290,12 +257,13 @@ cs::ptr make_ftype(const clang::Type* type) {
         --itor;
         clang::FieldDecl* fd = *itor;
         fds = cs::Scons(scheme_list(cs::Sstring_to_symbol(fd->getName().data()),
-                          make_ftype<true>(fd->getType())), fds);
+                                    make_ftype<true>(fd->getType())),
+                        fds);
       }
       if (rt->isUnionType()) {
         return scheme_list(cs_union_symbol, fds);
       } else if (rt->isStructureType()) {
-        return scheme_list(cs_struct_symbol, fds);
+        return cs::Scons(cs_struct_symbol, fds);
       } else {
         llvm::errs() << "unknown record type in make_ftype, only struct and "
                         "union are allowed.";
@@ -306,20 +274,10 @@ cs::ptr make_ftype(const clang::Type* type) {
     assert(false && "unreachabel path");
   }
   if (auto* tt = llvm::dyn_cast<clang::TypedefType>(type)) {
-    if (trace_clang) {
-      llvm::errs() << "TypedefType\n";
-    }
-    if (name_ok) {
-      if (const char* name = tt->getTypeClassName()) {
-        return cs::Sstring_to_symbol(name);
-      }
-    }
-    return make_ftype<name_ok>(tt->desugar());
+    const clang::TypedefNameDecl* td = tt->getDecl();
+    return cs::Sstring_to_symbol(td->getNameAsString().data());
   }
   if (auto* tt = llvm::dyn_cast<clang::TypeOfExprType>(type)) {
-    if (trace_clang) {
-      llvm::errs() << "TypeOfExprType\n";
-    }
     return make_ftype<true>(tt->desugar());
   }
   llvm::errs() << "unknown type in make_ftype:";
@@ -335,7 +293,7 @@ cs::ptr make_ftype(clang::QualType qt) {
 class ChezCffiConsumer : public clang::ASTConsumer {
   clang::CompilerInstance& ci;
   clang::ASTContext& context;
-  std::unique_ptr<std::ostream> os;
+  std::string output_file_name;
 
   bool only_original_file;
   bool trace_clang, trace_scheme;
@@ -356,7 +314,7 @@ class ChezCffiConsumer : public clang::ASTConsumer {
       if (!name.isEmpty()) {
         std::string nss = "enum-";
         nss += name.getAsString();
-        ret2 = cs::Scons(cs::Scons(cs::Sstring(nss.data()), type), ret2);
+        ret2 = cs::Scons(scheme_list(cs::Sstring(nss.data()), type), ret2);
       }
       for (clang::EnumConstantDecl* ecd : ed->enumerators()) {
         llvm::StringRef name = ecd->getName();
@@ -371,10 +329,10 @@ class ChezCffiConsumer : public clang::ASTConsumer {
 
     if (trace_scheme) {
       cs::Scall1(cs_display, cs::Sstring("ret1 from emit_enum_field_decls:\n"));
-      cs::Scall1(cs_display, ret1);
+      cs::Scall1(cs_write, ret1);
       cs::Scall0(cs_newline);
       cs::Scall1(cs_display, cs::Sstring("ret2 from emit_enum_field_decls:\n"));
-      cs::Scall1(cs_display, ret2);
+      cs::Scall1(cs_write, ret2);
       cs::Scall0(cs_newline);
     }
     return std::make_pair(ret1, ret2);
@@ -384,7 +342,6 @@ class ChezCffiConsumer : public clang::ASTConsumer {
     // order all struct/union decls, so that
     // a struct/union's field appears before itself
     // typedef names are ordered
-    size_t num = records_declared.size();
     std::vector<const clang::Decl*> ordered;
     std::unordered_set<const clang::Type*> visited;
     struct stack_frame {
@@ -393,10 +350,11 @@ class ChezCffiConsumer : public clang::ASTConsumer {
         bool first;
         clang::RecordDecl::field_iterator itor;
       };
-      stack_frame(const clang::Decl* decl_, bool first_): decl(decl_), first(first_) {
-      }
-      stack_frame(const clang::Decl* decl_, clang::RecordDecl::field_iterator itor_) : decl(decl_), itor(itor_) {
-      }
+      stack_frame(const clang::Decl* decl_, bool first_)
+          : decl(decl_), first(first_) {}
+      stack_frame(const clang::Decl* decl_,
+                  clang::RecordDecl::field_iterator itor_)
+          : decl(decl_), itor(itor_) {}
     };
     llvm::SmallVector<stack_frame, 32> stack;
 
@@ -431,7 +389,8 @@ class ChezCffiConsumer : public clang::ASTConsumer {
           }
         } else {
           const auto* td = llvm::cast<clang::TypedefDecl>(decl);
-          const clang::Type* type = td->getTypeSourceInfo()->getType().getTypePtr();
+          const clang::Type* type =
+              td->getTypeSourceInfo()->getType().getTypePtr();
           if (stack.back().first) {
             stack.back().first = false;
             if (try_insert(type)) {
@@ -456,8 +415,7 @@ class ChezCffiConsumer : public clang::ASTConsumer {
         }
       }
     }
-    for (const clang::TypedefDecl* td: typedef_declared) {
-      const clang::Type* type1 = td->getTypeForDecl();
+    for (const clang::TypedefDecl* td : typedef_declared) {
       const clang::Type* type = td->getTypeSourceInfo()->getType().getTypePtr();
       if (visited.insert(type).second) {
         stack.emplace_back(td, true);
@@ -467,31 +425,37 @@ class ChezCffiConsumer : public clang::ASTConsumer {
       }
     }
     cs::ptr ret = cs::snil;
-    for (const clang::Decl* decl: ordered) {
+    for (const clang::Decl* decl : ordered) {
       if (const auto* rd = llvm::dyn_cast<clang::RecordDecl>(decl)) {
-          //llvm::errs() << "record type in emit_type_definitions:\n";
+        // llvm::errs() << "record type in emit_type_definitions:\n";
         std::string name;
         if (rd->isStruct()) {
           name = "struct-";
         } else if (rd->isUnion()) {
           name = "union-";
         } else {
-          llvm::errs() << "unknown non-struct/union record in emit_type_definitions:\n";
+          llvm::errs()
+              << "unknown non-struct/union record in emit_type_definitions:\n";
           decl->dump();
           continue;
         }
         name += rd->getNameAsString();
-        ret = cs::Scons(cs::Scons(cs::Sstring(name.data()), make_ftype<false>(rd->getTypeForDecl())), ret);
+        ret = cs::Scons(scheme_list(cs::Sstring(name.data()),
+                                    make_ftype<false>(rd->getTypeForDecl())),
+                        ret);
       } else if (const auto* td = llvm::dyn_cast<clang::TypedefDecl>(decl)) {
-          //llvm::errs() << "typedef type in emit_type_definitions:\n";
-          std::string name = td->getNameAsString();
-          const clang::Type* type = td->getTypeSourceInfo()->getType().getTypePtr();
-          ret = cs::Scons(cs::Scons(cs::Sstring(name.data()), make_ftype<false>(type)), ret);
-          //ret = cs::Scons(cs::Sstring(name.data()), ret);
+        // llvm::errs() << "typedef type in emit_type_definitions:\n";
+        std::string name = td->getNameAsString();
+        const clang::Type* type =
+            td->getTypeSourceInfo()->getType().getTypePtr();
+        ret = cs::Scons(scheme_list(cs::Sstring_to_symbol(name.data()),
+                                    make_ftype<false>(type)),
+                        ret);
+        // ret = cs::Scons(cs::Sstring(name.data()), ret);
       } else {
-          llvm::errs() << "unknown type in emit_type_definitions:\n";
-          decl->dump();
-          continue;
+        llvm::errs() << "unknown type in emit_type_definitions:\n";
+        decl->dump();
+        continue;
       }
       /*
       clang::RecordDecl* rd = rt->getDecl();
@@ -507,7 +471,7 @@ class ChezCffiConsumer : public clang::ASTConsumer {
     }
     if (trace_scheme) {
       cs::Scall1(cs_display, cs::Sstring("ret from emit_type_definitions:\n"));
-      cs::Scall1(cs_display, ret);
+      cs::Scall1(cs_write, ret);
       cs::Scall0(cs_newline);
     }
     return ret;
@@ -515,14 +479,20 @@ class ChezCffiConsumer : public clang::ASTConsumer {
 
   cs::ptr emit_function_decls() {
     cs::ptr ret = cs::snil;
-    for (const clang::FunctionDecl* fd: functions_declared) {
+    for (const clang::FunctionDecl* fd : functions_declared) {
       llvm::StringRef name = fd->getName();
       std::string nss(name.data(), name.size());
-      ret = cs::Scons(cs::Scons(cs::Sstring_to_symbol(nss.data()), make_ftype<false>(fd->getType())), ret);
+      cs::ptr name_string = cs::Sstring(nss.data());
+      cs::ptr type = cs::cdr(make_ftype<false>(fd->getType()));
+      type =
+          cs::Scons(cs_foreign_procedure_symbol, cs::Scons(name_string, type));
+      ret = cs::Scons(scheme_list(cs_define_symbol,
+                                  cs::Sstring_to_symbol(name.data()), type),
+                      ret);
     }
     if (trace_scheme) {
       cs::Scall1(cs_display, cs::Sstring("ret from emit_function_decls:\n"));
-      cs::Scall1(cs_display, ret);
+      cs::Scall1(cs_write, ret);
       cs::Scall0(cs_newline);
     }
     return ret;
@@ -530,20 +500,26 @@ class ChezCffiConsumer : public clang::ASTConsumer {
 
   cs::ptr emit_var_decls() {
     cs::ptr ret = cs::snil;
-    for (const clang::VarDecl* vd: vars_declared) {
+    for (const clang::VarDecl* vd : vars_declared) {
       llvm::StringRef name = vd->getName();
       std::string nss(name.data(), name.size());
-      ret = cs::Scons(cs::Scons(cs::Sstring_to_symbol(nss.data()), make_ftype<true>(vd->getType())), ret);
+      cs::ptr type = make_ftype<true>(vd->getType());
+      cs::ptr def = scheme_list(
+          cs_define_symbol, cs::Sstring_to_symbol(nss.data()),
+          scheme_list(
+              cs_make_ftype_pointer_symbol, type,
+              scheme_list(cs_foreign_entry_symbol, cs::Sstring(nss.data()))));
+      ret = cs::Scons(def, ret);
     }
     if (trace_scheme) {
       cs::Scall1(cs_display, cs::Sstring("ret from emit_var_decls:\n"));
-      cs::Scall1(cs_display, ret);
+      cs::Scall1(cs_write, ret);
       cs::Scall0(cs_newline);
     }
     return ret;
   }
 
-  cs::ptr emit_scheme_code() {
+  void emit_scheme_code() {
     if (trace_clang) {
       llvm::errs() << "emit_scheme_code:\n";
       llvm::errs() << "enums: \n";
@@ -568,12 +544,23 @@ class ChezCffiConsumer : public clang::ASTConsumer {
       }
     }
     auto ep = emit_enum_field_decls();
-    cs::ptr p1 = ep.first;
     cs::ptr p2 = emit_type_definitions();
     cs::ptr p3 = emit_function_decls();
     cs::ptr p4 = emit_var_decls();
-    //return scheme_list(p1, p2, p3, p4);
-    return cs::snil;
+    cs::ptr p5 = cs::Scons(cs_begin_symbol, scheme_concat(ep.first, ep.second, p2, p3, p4));
+    std::filesystem::remove(std::filesystem::path(output_file_name));
+    cs::ptr path = cs::Sstring(output_file_name.data());
+    /*
+    cs::ptr trans_coder = cs::Scall0(cs::Sstring_to_symbol("utf-8-codec"));
+    cs::Sinitframe(4);
+    cs::Sput_arg(1, path);
+    cs::Sput_arg(2, cs::sfalse);
+    cs::Sput_arg(3, cs::sfalse);
+    cs::Sput_arg(4, trans_coder);
+    */
+    //cs::ptr op = cs::Scall(cs_open_output_file, 4);
+    cs::ptr op = cs::Scall1(cs_open_output_file, path);
+    cs::Scall2(cs_write, p5, op);
   }
 
   bool should_skip(clang::Decl* D) {
@@ -620,14 +607,17 @@ class ChezCffiConsumer : public clang::ASTConsumer {
  public:
   ChezCffiConsumer(clang::CompilerInstance& ci_,
                    std::vector<std::string> boot_files,
-                   std::unique_ptr<std::ostream> os_, bool oof_, bool trace_clang_, bool trace_scheme_)
-      : ci(ci_), context(ci.getASTContext()),
-        os(std::move(os_)),
+                   std::string output_file_name_, bool oof_,
+                   bool trace_clang_, bool trace_scheme_)
+      : ci(ci_),
+        context(ci.getASTContext()),
+        output_file_name(output_file_name_),
         only_original_file(oof_),
-        trace_clang(trace_clang_), trace_scheme(trace_scheme_) {
-          TryInit(boot_files);
-        }
-  void HandleTranslationUnit(clang::ASTContext& Ctx) override {
+        trace_clang(trace_clang_),
+        trace_scheme(trace_scheme_) {
+    TryInit(boot_files);
+  }
+  void HandleTranslationUnit(clang::ASTContext&) override {
     if (trace_clang) {
       llvm::errs() << "HandleTranslationUnit\n";
     }
@@ -660,13 +650,14 @@ class ChezCffiAction : public clang::PluginASTAction {
   std::vector<std::string> boot_files;
 
  public:
-  ChezCffiAction() : only_original_file(false), trace_clang(false), trace_scheme(false) {}
+  ChezCffiAction()
+      : only_original_file(false), trace_clang(false), trace_scheme(false) {}
   std::unique_ptr<clang::ASTConsumer> CreateASTConsumer(
       clang::CompilerInstance& CI, llvm::StringRef) override {
     llvm::errs() << "chez scheme vesion: " << cs::Skernel_version() << '\n';
-    auto os = std::make_unique<std::ofstream>(output_file_name);
-    return std::make_unique<ChezCffiConsumer>(CI, boot_files, std::move(os),
-                                              only_original_file, trace_clang, trace_scheme);
+    return std::make_unique<ChezCffiConsumer>(CI, boot_files, output_file_name,
+                                              only_original_file, trace_clang,
+                                              trace_scheme);
   }
 
   bool ParseArgs(const clang::CompilerInstance&,
@@ -723,6 +714,7 @@ class ChezCffiAction : public clang::PluginASTAction {
   }
   bool usesPreprocessorOnly() const override { return false; }
 };
+
 clang::FrontendPluginRegistry::Add<ChezCffiAction> X(
     "chez-cffi", "generate chez scheme ffi for c headers");
 }  // namespace
